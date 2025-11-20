@@ -59,5 +59,6 @@ jobs:
 
     needs: tagList
     uses: ./.github/workflows/frontend-image.yml
+    secrets: inherit
     with:
       tag: ${{needs.tagList.outputs.tags}}
