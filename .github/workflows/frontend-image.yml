@@ -15,7 +15,7 @@ on:
       tag:
         description: 'Tag to publish'
         required: true
-        default: 'latest'
+        default: ''
 
 permissions:
   contents: read

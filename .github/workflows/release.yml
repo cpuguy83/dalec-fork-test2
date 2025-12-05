@@ -13,43 +13,6 @@ permissions:
   contents: read
 
 jobs:
-  tagList:
-    runs-on: ubuntu-latest
-    outputs:
-      tags: ${{ steps.tags.outputs.OUTPUT_TAGS }}
-    steps:
-      - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@95d9a5deda9de15063e7595e9719c11c38c90ae2 # v2.13.2
-        with:
-          egress-policy: audit
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          fetch-depth: 0
-      - name: Get image tag list
-        id: tags
-        run: |
-          set -eux -o pipefail
-
-          # Remove leading "v" from tag name
-          TRIMMED_REF_NAME="${REF_NAME#v}"
-
-          # Creates a comma separated list of tags
-          # - <major>.<minor>
-          # - <major>.<minor>.<patch>
-          OUTPUT_TAGS="${TRIMMED_REF_NAME%.*},${TRIMMED_REF_NAME}"
-
-          # Check if this tag is the latest release by fetching the latest release and comparing the tag to the tag being built.
-          LATEST_TAG="$(gh release view --json tagName -q .tagName)"
-          if [ "$REF_NAME" = "$LATEST_TAG" ]; then
-            OUTPUT_TAGS="latest,${OUTPUT_TAGS}"
-          fi
-
-          echo "OUTPUT_TAGS=${OUTPUT_TAGS}" >> "$GITHUB_OUTPUT" && cat "$GITHUB_OUTPUT"
-        env:
-          REF_NAME: ${{ github.ref_name }}
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-
   build:
     permissions:
       contents: read
@@ -57,7 +20,8 @@ jobs:
       id-token: write  # Required for cosign OIDC signing
       attestations: write  # Required for GitHub attestations
 
-    needs: tagList
     uses: ./.github/workflows/frontend-image.yml
     with:
-      tag: ${{needs.tagList.outputs.tags}}
+      tag: |
+        type=semver,pattern={{version}}
+        type=semver,pattern={{major}}.{{minor}}
