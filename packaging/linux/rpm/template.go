@@ -67,7 +67,8 @@ var tmplFuncs = map[string]any{
 
 type specWrapper struct {
 	*dalec.Spec
-	Target string
+	Target       string
+	SourceFilter dalec.SourceFilterConfig
 }
 
 func (w *specWrapper) Changelog() (fmt.Stringer, error) {
@@ -337,18 +338,43 @@ func (w *specWrapper) Sources() (fmt.Stringer, error) {
 		if scanner.Err() != nil {
 			return nil, scanner.Err()
 		}
+		if !w.SourceFilter.IsEmpty() && isDir {
+			if err := docSourceFilter(b, "Exclusions", w.SourceFilter.GlobalExcludes); err != nil {
+				return nil, err
+			}
+		}
 		fmt.Fprintf(b, "Source%d: %s\n", idx, ref)
 	}
 
 	sourceIdx := len(keys)
 
 	if w.Spec.HasGomods() {
+		if !w.SourceFilter.IsEmpty() {
+			if err := docSourceFilter(b, "Exclusions", w.SourceFilter.GlobalExcludes); err != nil {
+				return nil, err
+			}
+		}
 		fmt.Fprintf(b, "Source%d: %s.tar.gz\n", sourceIdx, gomodsName)
 		sourceIdx += 1
 	}
 
 	if w.Spec.HasCargohomes() {
+		if !w.SourceFilter.IsEmpty() {
+			if err := docSourceFilter(b, "Exclusions", w.SourceFilter.GlobalExcludes); err != nil {
+				return nil, err
+			}
+		}
 		fmt.Fprintf(b, "Source%d: %s.tar.gz\n", sourceIdx, cargohomeName)
+		sourceIdx += 1
+	}
+
+	if w.Spec.HasPips() {
+		if !w.SourceFilter.IsEmpty() {
+			if err := docSourceFilter(b, "Exclusions", w.SourceFilter.GlobalExcludes); err != nil {
+				return nil, err
+			}
+		}
+		fmt.Fprintf(b, "Source%d: %s.tar.gz\n", sourceIdx, pipDepsName)
 		sourceIdx += 1
 	}
 
@@ -360,6 +386,24 @@ func (w *specWrapper) Sources() (fmt.Stringer, error) {
 		b.WriteString("\n")
 	}
 	return b, nil
+}
+
+func docSourceFilter(w io.Writer, name string, values []string) error {
+	if _, err := fmt.Fprintf(w, "# %s:\n", name); err != nil {
+		return err
+	}
+	for _, value := range values {
+		scanner := bufio.NewScanner(strings.NewReader(value))
+		for scanner.Scan() {
+			if _, err := fmt.Fprintf(w, "# \t%s\n", scanner.Text()); err != nil {
+				return err
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *specWrapper) Release() string {
@@ -460,20 +504,11 @@ func (w *specWrapper) BuildSteps() fmt.Stringer {
 }
 
 func systemdPreUnScript(unitName string, cfg dalec.SystemdUnitConfig) string {
-	// if service isn't explicitly specified as enabled in the spec,
-	// then we don't need to do anything in the preun script
 	if !cfg.Enable {
 		return ""
 	}
 
-	// should be equivalent to the systemd_preun scriptlet in the rpm spec,
-	// but without the use of a .preset file
-	return fmt.Sprintf(`
-if [ $1 -eq 0 ]; then
-    # complete uninstallation
-    systemctl disable --now %s
-fi
-`, unitName)
+	return fmt.Sprintf("%%systemd_preun %s\n", unitName)
 }
 
 func (w *specWrapper) PreUn() fmt.Stringer {
@@ -497,30 +532,35 @@ func (w *specWrapper) PreUn() fmt.Stringer {
 }
 
 func systemdPostScript(unitName string, cfg dalec.SystemdUnitConfig) string {
-	// if service isn't explicitly specified as enabled in the spec,
-	// then we don't need to do anything in the post script
 	if !cfg.Enable {
 		return ""
 	}
 
-	// should be equivalent to the systemd_post scriptlet in the rpm spec,
-	// but without the use of a .preset file
-	s := `
-if [ $1 -eq 1 ]; then
-    # initial installation`
-
-	// Enable/start service when package is installed
-	if cfg.Start {
-		s = s + fmt.Sprintf(`
-    systemctl enable --now %s`, unitName)
-	} else {
-		s = s + fmt.Sprintf(`
-    systemctl enable %s`, unitName)
-	}
-
-	s = s + `
+	// Use systemctl enable directly instead of %systemd_post because
+	// %systemd_post calls "systemctl preset" which defers to system preset
+	// policy. All RPM distros have "disable *" as a catch-all in their preset
+	// files, so third-party services would never be enabled via preset.
+	// This behavior may change in the future to respect system presets instead.
+	// See https://github.com/project-dalec/dalec/issues/1017#issuecomment-4181051908
+	//
+	// The "|| :" ensures a non-zero exit (e.g. systemd not running in a
+	// chroot/Kickstart/container) does not abort the scriptlet.
+	// Only enable on initial install ($1 == 1), not upgrades.
+	s := fmt.Sprintf(`if [ $1 -eq 1 ]; then
+    systemctl enable %s || :
 fi
-`
+`, unitName)
+
+	if cfg.Start {
+		// Only start on initial install ($1 == 1), not upgrades, to avoid
+		// restarting a service the user intentionally stopped.
+		// Guard behind a check for a running systemd so this is safe
+		// in chroot/Kickstart/container environments.
+		s += fmt.Sprintf(`if [ $1 -eq 1 ] && [ -d /run/systemd/system ]; then
+    systemctl start %s || :
+fi
+`, unitName)
+	}
 
 	return s
 }
@@ -1137,7 +1177,11 @@ func (w *specWrapper) DisableAutoReq() string {
 
 // WriteSpec generates an rpm spec from the provided [dalec.Spec] and distro target and writes it to the passed in writer
 func WriteSpec(spec *dalec.Spec, target string, w io.Writer) error {
-	s := &specWrapper{spec, target}
+	return WriteSpecWithSourceFilter(spec, target, dalec.SourceFilterConfig{}, w)
+}
+
+func WriteSpecWithSourceFilter(spec *dalec.Spec, target string, filter dalec.SourceFilterConfig, w io.Writer) error {
+	s := &specWrapper{Spec: spec, Target: target, SourceFilter: filter}
 
 	err := specTmpl.Execute(w, s)
 	if err != nil {

@@ -41,7 +41,7 @@ cosign verify ghcr.io/project-dalec/dalec/frontend:$VERSION \
   --certificate-identity https://github.com/project-dalec/dalec/.github/workflows/frontend-image.yml@refs/tags/$VERSION
 
 # 3. If verification succeeds, you can safely use Dalec
-docker build -f my-spec.yml --target mariner2/rpm .
+docker build -f my-spec.yml --target azlinux3/rpm .
 ```
 
 If verification fails, **do not use that image** - it may be compromised or unofficial.
@@ -56,6 +56,39 @@ The following container images are signed when published as releases:
 **Note**: Docker pulls these images automatically when you run builds. You don't reference them directly in your Dockerfile, but you should verify them before first use.
 
 Images are signed using [Sigstore's cosign](https://github.com/sigstore/cosign) with keyless signing via GitHub OIDC tokens.
+
+Release tags are also signed before the immutable GitHub Release is published. Maintainers request releases by opening a PR that adds `.github/releases/<tag>.md` on `main` or the relevant `release/**` branch. After the PR merges, the `Create Release` workflow waits for the protected `release` environment, uses [Sigstore's gitsign](https://github.com/sigstore/gitsign) and GitHub Actions OIDC instead of a long-lived private key, then dispatches the release image publishing workflows against the signed tag.
+
+Agents can use the `/release-request` skill to prepare the release request PR.
+
+Release request files use YAML front matter plus a Markdown body:
+
+```markdown
+---
+tag: v0.20.0
+target: 0123456789abcdef0123456789abcdef01234567
+prerelease: false
+notes_start_tag: v0.19.0
+---
+
+# Dalec v0.20.0
+
+This release request creates the signed `v0.20.0` tag and publishes an immutable
+GitHub Release after approval through the `release` environment.
+
+## Release notes
+
+Optional curated release notes can go here. When present, this section is
+prepended to GitHub's generated release notes.
+
+## Maintainer checklist
+
+- [ ] The target commit is the intended release commit.
+- [ ] CI is green on the target branch.
+- [ ] Generated release notes have been reviewed.
+```
+
+`target` must be the full commit SHA to tag and must be reachable from the branch where the release request PR merges. `notes_start_tag` is optional and is passed to GitHub's generated release notes. The optional `## Release notes` section is prepended to GitHub's generated release notes; other Markdown body content is for reviewer context only.
 
 ## Prerequisites
 
@@ -84,7 +117,23 @@ gh attestation verify oci://ghcr.io/project-dalec/dalec/frontend:$VERSION --owne
 
 This guide primarily uses cosign for detailed examples, but GitHub CLI is simpler for basic verification.
 
+To verify release tag signatures, install [gitsign](https://github.com/sigstore/gitsign) separately.
+
 ## Verifying Image Signatures
+
+### Verify Release Tag Signatures
+
+Official release tags are signed by `.github/workflows/create-release.yml` from `main` for major/minor releases or from a `release/**` branch for patch releases:
+
+```bash
+export VERSION=v0.19.0
+git fetch --tags https://github.com/project-dalec/dalec.git "$VERSION"
+gitsign verify "$VERSION" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity https://github.com/project-dalec/dalec/.github/workflows/create-release.yml@refs/heads/main
+```
+
+For a patch release produced from a release branch, replace `refs/heads/main` with that branch, for example `refs/heads/release/0.20`.
 
 ### Verify Frontend Image
 
@@ -236,7 +285,7 @@ jobs:
       - name: Build Package with Dalec
         run: |
           # Now safely use Dalec to build your package
-          docker build -f my-package.yml --target mariner2/rpm -o ./output .
+          docker build -f my-package.yml --target azlinux3/rpm -o ./output .
 ```
 
 ### GitLab CI Example
@@ -259,7 +308,7 @@ build-package:
   stage: build
   needs: [verify-dalec]
   script:
-    - docker build -f my-package.yml --target mariner2/rpm -o ./output .
+    - docker build -f my-package.yml --target azlinux3/rpm -o ./output .
 ```
 
 ### Best Practices

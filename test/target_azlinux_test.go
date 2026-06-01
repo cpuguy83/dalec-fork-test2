@@ -8,11 +8,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/project-dalec/dalec"
-	"github.com/project-dalec/dalec/targets/linux/rpm/azlinux"
 	"github.com/moby/buildkit/client/llb"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/project-dalec/dalec"
+	"github.com/project-dalec/dalec/targets/linux/rpm/azlinux"
 )
 
 var azlinuxTestRepoConfig = func(keyPath, repoPath string) map[string]dalec.Source {
@@ -37,49 +37,6 @@ metadata_expire=0
 	}
 }
 
-func TestMariner2(t *testing.T) {
-	t.Parallel()
-
-	ctx := startTestSpan(baseCtx, t)
-	cfg := testLinuxConfig{
-		Target: targetConfig{
-			Package:   "mariner2/rpm",
-			Container: "mariner2/container",
-			Worker:    "mariner2/worker",
-			FormatDepEqual: func(v, _ string) string {
-				return v
-			},
-			ListExpectedSignFiles: azlinuxListSignFiles("cm2"),
-		},
-		LicenseDir: "/usr/share/licenses",
-		SystemdDir: struct {
-			Units   string
-			Targets string
-		}{
-			Units:   "/usr/lib/systemd",
-			Targets: "/etc/systemd/system",
-		},
-		Worker: workerConfig{
-			ContextName:    azlinux.Mariner2WorkerContextName,
-			CreateRepo:     createYumRepo(azlinux.Mariner2Config),
-			SignRepo:       signRepoAzLinux,
-			TestRepoConfig: azlinuxTestRepoConfig,
-		},
-		Release: OSRelease{
-			ID:        "mariner",
-			VersionID: "2.0",
-		},
-		Platforms: []ocispecs.Platform{
-			{OS: "linux", Architecture: "amd64"},
-			{OS: "linux", Architecture: "arm64"},
-		},
-		PackageOutputPath: rpmTargetOutputPath("cm2"),
-	}
-
-	testLinuxDistro(ctx, t, cfg)
-	testAzlinuxExtra(ctx, t, cfg)
-}
-
 func TestAzlinux3(t *testing.T) {
 	t.Parallel()
 
@@ -89,6 +46,7 @@ func TestAzlinux3(t *testing.T) {
 			Key:                   "azlinux3",
 			Package:               "azlinux3/rpm",
 			Container:             "azlinux3/container",
+			DepsOnly:              "azlinux3/container/depsonly",
 			Worker:                "azlinux3/worker",
 			Sysext:                "azlinux3/testing/sysext",
 			ListExpectedSignFiles: azlinuxListSignFiles("azl3"),
@@ -104,7 +62,7 @@ func TestAzlinux3(t *testing.T) {
 		Worker: workerConfig{
 			ContextName:    azlinux.Azlinux3WorkerContextName,
 			CreateRepo:     createYumRepo(azlinux.Azlinux3Config),
-			SignRepo:       signRepoAzLinux,
+			SignRepo:       signRepoDnf,
 			TestRepoConfig: azlinuxTestRepoConfig,
 			SysextWorker:   azlinux.Azlinux3Config.SysextWorker,
 		},
@@ -112,6 +70,7 @@ func TestAzlinux3(t *testing.T) {
 			ID:        "azurelinux",
 			VersionID: "3.0",
 		},
+		SupportsGomodVersionUpdate: true,
 		Platforms: []ocispecs.Platform{
 			{OS: "linux", Architecture: "amd64"},
 			{OS: "linux", Architecture: "arm64"},
@@ -119,7 +78,7 @@ func TestAzlinux3(t *testing.T) {
 		PackageOutputPath: rpmTargetOutputPath("azl3"),
 	}
 	testLinuxDistro(ctx, t, cfg)
-	testAzlinuxExtra(ctx, t, cfg)
+	testAzlinuxExtra(ctx, t, cfg, azlinux.Azlinux3Config.ImageRef)
 
 	t.Run("ca-certs override", func(t *testing.T) {
 		t.Parallel()
@@ -128,13 +87,14 @@ func TestAzlinux3(t *testing.T) {
 	})
 }
 
-func testAzlinuxExtra(ctx context.Context, t *testing.T, cfg testLinuxConfig) {
-
+func testAzlinuxExtra(ctx context.Context, t *testing.T, cfg testLinuxConfig, distroImageRef string) {
 	t.Run("base deps", func(t *testing.T) {
 		t.Parallel()
 		ctx := startTestSpan(ctx, t)
 		testAzlinuxBaseDeps(ctx, t, cfg.Target)
 	})
+
+	testSignedRPMCustomBaseImage(ctx, t, cfg.Target, distroImageRef)
 }
 
 func testAzlinuxCaCertsOverride(ctx context.Context, t *testing.T, target targetConfig) {
@@ -172,45 +132,6 @@ func azlinuxListSignFiles(ver string) func(*dalec.Spec, ocispecs.Platform) []str
 	}
 }
 
-func signRepoAzLinux(gpgKey llb.State, repoPath string) llb.StateOption {
-	// key should be a state that has a public key under /public.key
-	return func(in llb.State) llb.State {
-		// For tdnf-based distros (Azlinux, Mariner), only sign repo metadata.
-		// tdnf only verifies repo metadata signatures, not individual package signatures.
-		// This is different from dnf which verifies both.
-
-		scriptDt := `
-#!/usr/bin/env bash
-
-set -eux -o pipefail
-
-gpg --import < /tmp/gpg/private.key
-ID=$(gpg --list-keys --keyid-format LONG | grep -B 2 'test@example.com' | grep 'pub' | awk '{print $2}' | cut -d'/' -f2)
-
-# For tdnf-based distros, only sign repo metadata, not individual packages
-# tdnf only checks repo metadata signatures, not package signatures
-# Signing packages can hang if rpmsign tries to prompt for passphrase
-
-# Regenerate repo metadata
-rm -rf ` + repoPath + `/repodata
-createrepo --compatibility ` + repoPath + `
-
-# Sign only the repo metadata
-gpg --detach-sign --default-key "$ID" --armor --yes ` + repoPath + `/repodata/repomd.xml
-`
-
-		script := llb.Scratch().File(
-			llb.Mkfile("/script.sh", 0o755, []byte(scriptDt)),
-		)
-
-		return in.Run(
-			llb.AddMount("/tmp/signing", script, llb.Readonly),
-			llb.AddMount("/tmp/gpg", gpgKey, llb.Readonly),
-			dalec.ShArgs("/tmp/signing/script.sh"),
-		).Root()
-	}
-}
-
 func signRepoDnf(gpgKey llb.State, repoPath string) llb.StateOption {
 	// key should be a state that has a public key under /public.key
 	return func(in llb.State) llb.State {
@@ -238,14 +159,18 @@ createrepo --compatibility ` + repoPath + `
 gpg --detach-sign --default-key "$ID" --armor --yes ` + repoPath + `/repodata/repomd.xml
 `
 
+		pg := dalec.ProgressGroup("in-signing-script")
+
 		script := llb.Scratch().File(
 			llb.Mkfile("/script.sh", 0o755, []byte(scriptDt)),
+			pg,
 		)
 
 		return in.Run(
 			llb.AddMount("/tmp/signing", script, llb.Readonly),
 			llb.AddMount("/tmp/gpg", gpgKey, llb.Readonly),
 			dalec.ShArgs("/tmp/signing/script.sh"),
+			pg,
 		).Root()
 	}
 }

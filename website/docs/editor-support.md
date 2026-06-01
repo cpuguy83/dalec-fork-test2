@@ -5,9 +5,32 @@ title: Editor Support
 We provide a [JSON schema file](https://github.com/project-dalec/dalec/blob/main/docs/spec.schema.json) to integrate with your editor.
 This will help validate your yaml files and provide intellisense for the spec.
 
+Alternatively, the schema can be fetched from the dalec frontend starting with v0.20:
+
+### With an existing spec
+
+```bash
+docker buildx build --call dalec.schema -< path/to/spec
+```
+
+This loads the version of dalec set in the "syntax" directive of the spec file.
+
+### Without a spec
+
+```bash
+# Provide an empty spec to stdin and set the buildkit frontend parser with the `BUILDKIT_SYNTAX` build arg.
+docker buildx build --call dalec.schema --build-arg BUILDKIT_SYNTAX=ghcr.io/project-dalec/frontend:latest -<<<'{}'
+```
+
 ## VSCode
 
-For VSCode you'll need to use a YAML plugin that supports JSON schemas, such as [YAML Support by Red Hat](https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml).
+### Dalec Extension
+
+The [Dalec VSCode Extension](https://github.com/project-dalec/dalec-vscode-extension) provides support for Dalec spec files with validation, syntax highlighting, and IntelliSense.
+
+### Manual Configuration
+
+You can also use a YAML plugin that supports JSON schemas, such as [YAML Support by Red Hat](https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml).
 Follow the plugins instructions to add the schema to your workspace.
 Here are some examples of vscode workspace configs `settings.json` enabling the JSON schema:
 

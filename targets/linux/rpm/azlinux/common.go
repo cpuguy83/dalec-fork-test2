@@ -3,9 +3,9 @@ package azlinux
 import (
 	"context"
 
+	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/project-dalec/dalec"
 	"github.com/project-dalec/dalec/frontend"
-	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 )
 
 var (
@@ -17,7 +17,6 @@ var (
 	}
 
 	targets = map[string]gwclient.BuildFunc{
-		Mariner2TargetKey: Mariner2Config.Handle,
 		AzLinux3TargetKey: Azlinux3Config.Handle,
 	}
 

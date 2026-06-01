@@ -1,15 +1,20 @@
-FROM --platform=${BUILDPLATFORM} golang:1.24@sha256:5056a223ebbba06c4441cda05dc0a99f77896dde04472710f02ea30c47f7be00 AS go
+FROM --platform=${BUILDPLATFORM} golang:1.25@sha256:cc737435e2742bd6da3b7d575623968683609a3d2e0695f9d85bee84071c08e6 AS go
 
 FROM go  AS frontend-build
 WORKDIR /build
 COPY . .
 ENV CGO_ENABLED=0
 ARG TARGETARCH TARGETOS GOFLAGS=-trimpath
+ARG DALEC_FRONTEND_COVERAGE=0
 ENV GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOFLAGS=${GOFLAGS}
 RUN \
     --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go build -o /frontend ./cmd/frontend
+    if [ "${DALEC_FRONTEND_COVERAGE}" = "1" ]; then \
+	go build -cover -covermode=atomic -coverpkg=./... -o /frontend ./cmd/frontend ; \
+    else \
+        go build -o /frontend ./cmd/frontend ; \
+    fi
 
 FROM scratch AS frontend
 COPY --from=frontend-build /frontend /frontend

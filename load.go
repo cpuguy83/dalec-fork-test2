@@ -39,6 +39,10 @@ func knownArg(key string) bool {
 		return true
 	case "DALEC_SKIP_TESTS":
 		return true
+	case "DALEC_SOURCE_FILTER_CONFIG_PATH":
+		return true
+	case "DALEC_SOURCE_FILTER_CONFIG_CONTEXT_NAME":
+		return true
 	case KeyDalecTarget:
 		return true
 	}
@@ -271,7 +275,7 @@ func (s *Spec) SubstituteArgs(env map[string]string, opts ...SubstituteOpt) erro
 		for i, ver := range v.Version {
 			updated, err := expandArgs(lex, ver, args, cfg.AllowArg)
 			if err != nil {
-				appendErr(errors.Wrapf(err, "replaces %s version %d", k, i))
+				appendErr(errors.Wrapf(err, "conflicts %s version %d", k, i))
 			}
 			s.Conflicts[k].Version[i] = updated
 		}
@@ -605,6 +609,26 @@ func (g *SourceGenerator) Validate() error {
 		// Gomod, Cargohome, Pip, and NodeMod are the only valid generator types
 		// An empty generator is invalid
 		return fmt.Errorf("no generator type specified")
+	}
+	if err := g.Gomod.validate(); err != nil {
+		return errors.Wrap(err, "gomod generator")
+	}
+
+	return nil
+}
+
+func (g *GeneratorGomod) validate() error {
+	// Validate gomod edits if present
+	if g != nil && g.Edits != nil {
+		var errs []error
+		for i, rep := range g.Edits.Replace {
+			if _, err := rep.goModEditArg(); err != nil {
+				errs = append(errs, errors.Wrapf(err, "replace[%d]", i))
+			}
+		}
+		if err := goerrors.Join(errs...); err != nil {
+			return errors.Wrap(err, "gomod edits")
+		}
 	}
 	return nil
 }

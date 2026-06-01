@@ -42,6 +42,16 @@ func TestSourceValidation(t *testing.T) {
 			expectErr: true,
 		},
 		{
+			title: "git source checksum accepts hex",
+			src: Source{
+				Git: &SourceGit{
+					URL:      "https://example.com/repo.git",
+					Commit:   "v1.2.3",
+					Checksum: "0123456789abcdef",
+				},
+			},
+		},
+		{
 			title:     "has multiple source types in docker-image command mount",
 			expectErr: true,
 			src: Source{
@@ -666,6 +676,7 @@ func TestSpec_SubstituteBuildArgs(t *testing.T) {
 	const (
 		foo            = "foo"
 		bar            = "bar"
+		checksum       = "baddecaf"
 		argWithDefault = "some default value"
 		plainOleValue  = "some plain old value"
 	)
@@ -701,6 +712,13 @@ func TestSpec_SubstituteBuildArgs(t *testing.T) {
 		Excludes: []string{"foo/${BAR}"},
 		Inline:   &SourceInline{},
 	}
+	spec.Sources["git"] = Source{
+		Git: &SourceGit{
+			URL:      "https://example.com/foo/${BAR}.git",
+			Commit:   "$FOO",
+			Checksum: "$CHECKSUM",
+		},
+	}
 
 	spec.Patches = map[string][]PatchSpec{
 		"src": {
@@ -727,6 +745,30 @@ func TestSpec_SubstituteBuildArgs(t *testing.T) {
 				},
 				Volumes: map[string]struct{}{
 					"": {},
+				},
+			},
+			Provides: map[string]PackageConstraints{
+				"p1": {
+					Version: []string{
+						"1.0",
+						"$FOO",
+					},
+				},
+			},
+			Replaces: map[string]PackageConstraints{
+				"p1": {
+					Version: []string{
+						"1.0",
+						"$FOO",
+					},
+				},
+			},
+			Conflicts: map[string]PackageConstraints{
+				"p1": {
+					Version: []string{
+						"1.0",
+						"$FOO",
+					},
 				},
 			},
 		},
@@ -771,13 +813,18 @@ func TestSpec_SubstituteBuildArgs(t *testing.T) {
 	env["BAR"] = bar
 
 	spec.Args["BAR"] = ""
+	spec.Args["CHECKSUM"] = ""
 	spec.Args["VAR_WITH_DEFAULT"] = argWithDefault
+	env["CHECKSUM"] = checksum
 
 	assert.NilError(t, spec.SubstituteArgs(env))
 
 	assert.Check(t, cmp.Equal(spec.Sources["patch"].Path, "foo/"+bar))
 	assert.Check(t, cmp.Equal(spec.Sources["patch"].Includes[0], "foo/"+bar))
 	assert.Check(t, cmp.Equal(spec.Sources["patch"].Excludes[0], "foo/"+bar))
+	assert.Check(t, cmp.Equal(spec.Sources["git"].Git.URL, "https://example.com/foo/"+bar+".git"))
+	assert.Check(t, cmp.Equal(spec.Sources["git"].Git.Commit, foo))
+	assert.Check(t, cmp.Equal(spec.Sources["git"].Git.Checksum, checksum))
 	assert.Check(t, cmp.Equal(spec.Patches["src"][0].Path, foo))
 
 	// Base package config
@@ -792,6 +839,12 @@ func TestSpec_SubstituteBuildArgs(t *testing.T) {
 	assert.Check(t, cmp.Equal(spec.Targets["t2"].PackageConfig.Signer.Args["WHATEVER"], argWithDefault))
 	assert.Check(t, cmp.Equal(spec.Targets["t2"].PackageConfig.Signer.Args["REGULAR"], plainOleValue))
 	assert.Check(t, cmp.Equal(spec.Targets["t2"].Image.Labels["foo"], foo))
+	assert.Check(t, cmp.Equal(spec.Targets["t2"].Provides["p1"].Version[0], "1.0"))
+	assert.Check(t, cmp.Equal(spec.Targets["t2"].Provides["p1"].Version[1], "foo"))
+	assert.Check(t, cmp.Equal(spec.Targets["t2"].Replaces["p1"].Version[0], "1.0"))
+	assert.Check(t, cmp.Equal(spec.Targets["t2"].Replaces["p1"].Version[1], "foo"))
+	assert.Check(t, cmp.Equal(spec.Targets["t2"].Conflicts["p1"].Version[0], "1.0"))
+	assert.Check(t, cmp.Equal(spec.Targets["t2"].Conflicts["p1"].Version[1], "foo"))
 
 	assert.Check(t, cmp.Equal(spec.Dependencies.Build["p1"].Version[0], "1.0"))
 	assert.Check(t, cmp.Equal(spec.Dependencies.Build["p1"].Version[1], "foo"))
@@ -799,6 +852,79 @@ func TestSpec_SubstituteBuildArgs(t *testing.T) {
 	assert.Check(t, cmp.Equal(spec.Dependencies.Runtime["p1"].Version[1], "foo"))
 	assert.Check(t, cmp.Equal(spec.Provides["p1"].Version[0], "1.0"))
 	assert.Check(t, cmp.Equal(spec.Replaces["p1"].Version[0], "1.0"))
+}
+
+func TestLoadSpec_TargetPackageMetadata(t *testing.T) {
+	dt := []byte(`
+name: test-pkg
+description: Test package
+website: https://example.com
+version: 1.0.0
+revision: 1
+license: MIT
+provides:
+  common-pkg:
+    version:
+      - "= 1.0.0"
+conflicts:
+  common-conflict:
+replaces:
+  common-replace:
+targets:
+  rpm:
+    provides:
+      rpm-virtual:
+        version:
+          - "= 2.0.0"
+    conflicts:
+      rpm-conflict:
+    replaces:
+      rpm-replace:
+  deb:
+    provides:
+      deb-virtual:
+        version:
+          - ">= 3.0.0"
+    conflicts:
+      deb-conflict:
+    replaces:
+      deb-replace:
+  empty:
+    provides: {}
+    conflicts: {}
+    replaces: {}
+`)
+
+	spec, err := LoadSpec(dt)
+	assert.NilError(t, err)
+
+	rpmProvides := spec.GetProvides("rpm")
+	assert.Check(t, cmp.Len(rpmProvides, 1))
+	assert.Check(t, cmp.DeepEqual(rpmProvides["rpm-virtual"].Version, []string{"= 2.0.0"}))
+	_, ok := spec.GetConflicts("rpm")["rpm-conflict"]
+	assert.Check(t, ok)
+	_, ok = spec.GetReplaces("rpm")["rpm-replace"]
+	assert.Check(t, ok)
+
+	debProvides := spec.GetProvides("deb")
+	assert.Check(t, cmp.Len(debProvides, 1))
+	assert.Check(t, cmp.DeepEqual(debProvides["deb-virtual"].Version, []string{">= 3.0.0"}))
+	_, ok = spec.GetConflicts("deb")["deb-conflict"]
+	assert.Check(t, ok)
+	_, ok = spec.GetReplaces("deb")["deb-replace"]
+	assert.Check(t, ok)
+
+	rootProvides := spec.GetProvides("unknown")
+	assert.Check(t, cmp.Len(rootProvides, 1))
+	assert.Check(t, cmp.DeepEqual(rootProvides["common-pkg"].Version, []string{"= 1.0.0"}))
+	_, ok = spec.GetConflicts("unknown")["common-conflict"]
+	assert.Check(t, ok)
+	_, ok = spec.GetReplaces("unknown")["common-replace"]
+	assert.Check(t, ok)
+
+	assert.Check(t, cmp.Len(spec.GetProvides("empty"), 0))
+	assert.Check(t, cmp.Len(spec.GetConflicts("empty"), 0))
+	assert.Check(t, cmp.Len(spec.GetReplaces("empty"), 0))
 }
 
 func TestCustomRepoFillDefaults(t *testing.T) {
@@ -1088,6 +1214,26 @@ targets:
 		assert.Check(t, cmp.Equal(target.Dependencies.ExtraRepos[0].Data[4].Spec.Build.Source.HTTP.URL, "https://test"))
 
 		assert.Check(t, cmp.Equal(target.PackageConfig.Signer.Args["FOO"], "test"))
+	})
+
+	t.Run("git checksum build arg loaded from yaml", func(t *testing.T) {
+		dt := []byte(`
+args:
+  COMMIT:
+sources:
+  test:
+    git:
+      url: https://example.com/repo.git
+      commit: v1.2.3
+      checksum: ${COMMIT}
+`)
+
+		spec, err := LoadSpec(dt)
+		assert.NilError(t, err)
+
+		err = spec.SubstituteArgs(map[string]string{"COMMIT": "0123456789abcdef"})
+		assert.NilError(t, err)
+		assert.Check(t, cmp.Equal(spec.Sources["test"].Git.Checksum, "0123456789abcdef"))
 	})
 
 	t.Run("default value", func(t *testing.T) {

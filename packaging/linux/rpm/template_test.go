@@ -161,8 +161,16 @@ func TestTemplateSources(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			s2 := out2.String()
-			if s2 != s {
-				t.Fatalf("expected no additional sources for pip, got: %q", s2)
+			// trim last newline from the first output since that has shifted
+			s3 := s[:len(s)-1]
+			if !strings.HasPrefix(s2, s3) {
+				t.Fatalf("expected output to start with %q, got %q", s, out2.String())
+			}
+
+			s2 = strings.TrimPrefix(out2.String(), s3)
+			expected := "Source1: " + pipDepsName + ".tar.gz\n\n"
+			if s2 != expected {
+				t.Fatalf("unexpected sources: expected %q, got: %q", expected, s2)
 			}
 		})
 
@@ -253,11 +261,10 @@ func TestTemplateSources(t *testing.T) {
 			s = s[len(expected):]
 		}
 
-		// Now we should have entries for gomods and cargohome.
+		// Now we should have entries for gomods, cargohome, and pip deps.
 		// Note there are 2 gomod sources but they should be combined into one entry.
-		// Pip no longer creates a separate cache source.
 
-		expected := "Source7: " + gomodsName + ".tar.gz\nSource8: " + cargohomeName + ".tar.gz\n\n"
+		expected := "Source7: " + gomodsName + ".tar.gz\nSource8: " + cargohomeName + ".tar.gz\nSource9: " + pipDepsName + ".tar.gz\n\n"
 		if s != expected {
 			t.Fatalf("generators: unexpected sources: expected %q, got: %q", expected, s)
 		}
@@ -265,6 +272,49 @@ func TestTemplateSources(t *testing.T) {
 		if s != "" {
 			t.Fatalf("unexpected trailing sources: %q", s)
 		}
+	})
+
+	t.Run("source filter docs", func(t *testing.T) {
+		w := &specWrapper{
+			Spec: &dalec.Spec{
+				Sources: map[string]dalec.Source{
+					"src1": {
+						Includes: []string{"cmd/**"},
+						Excludes: []string{"testdata/**"},
+						Inline: &dalec.SourceInline{
+							Dir: &dalec.SourceInlineDir{},
+						},
+					},
+				},
+			},
+			SourceFilter: dalec.SourceFilterConfig{GlobalExcludes: []string{"vendor/**"}},
+		}
+
+		out, err := w.Sources()
+		assert.NilError(t, err)
+		s := out.String()
+		assert.Check(t, strings.Contains(s, "# \tIncludes:\n# \t\t cmd/**\n"))
+		assert.Check(t, strings.Contains(s, "# \tExcludes:\n# \t\t testdata/**\n"))
+		assert.Check(t, strings.Contains(s, "# Exclusions:\n# \tvendor/**\n"))
+	})
+
+	t.Run("source filter docs multiline exclusion", func(t *testing.T) {
+		w := &specWrapper{
+			Spec: &dalec.Spec{
+				Sources: map[string]dalec.Source{
+					"src1": {
+						Inline: &dalec.SourceInline{Dir: &dalec.SourceInlineDir{}},
+					},
+				},
+			},
+			SourceFilter: dalec.SourceFilterConfig{GlobalExcludes: []string{"vendor/**\nmalicious: value"}},
+		}
+
+		out, err := w.Sources()
+		assert.NilError(t, err)
+		s := out.String()
+		assert.Check(t, strings.Contains(s, "# Exclusions:\n# \tvendor/**\n# \tmalicious: value\n"))
+		assert.Check(t, !strings.Contains(s, "\nmalicious: value\n"))
 	})
 }
 
@@ -281,7 +331,7 @@ func TestTemplate_Artifacts(t *testing.T) {
 						},
 						"test3.service": {
 							Enable: true,
-							Start: true,
+							Start:  true,
 						},
 					},
 				},
@@ -290,15 +340,14 @@ func TestTemplate_Artifacts(t *testing.T) {
 
 		assert.Equal(t, w.Post().String(),
 			`%post
-
 if [ $1 -eq 1 ]; then
-    # initial installation
-    systemctl enable test2.service
+    systemctl enable test2.service || :
 fi
-
 if [ $1 -eq 1 ]; then
-    # initial installation
-    systemctl enable --now test3.service
+    systemctl enable test3.service || :
+fi
+if [ $1 -eq 1 ] && [ -d /run/systemd/system ]; then
+    systemctl start test3.service || :
 fi
 
 `)
@@ -330,7 +379,7 @@ fi
 						},
 						"test3.service": {
 							Enable: true,
-							Start: true,
+							Start:  true,
 						},
 					},
 				},
@@ -339,16 +388,8 @@ fi
 
 		assert.Equal(t, w.PreUn().String(),
 			`%preun
-
-if [ $1 -eq 0 ]; then
-    # complete uninstallation
-    systemctl disable --now test2.service
-fi
-
-if [ $1 -eq 0 ]; then
-    # complete uninstallation
-    systemctl disable --now test3.service
-fi
+%systemd_preun test2.service
+%systemd_preun test3.service
 `)
 	})
 

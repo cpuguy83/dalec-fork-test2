@@ -2,10 +2,12 @@ package distro
 
 import (
 	"fmt"
+	"path"
 	"path/filepath"
 	"strings"
 
 	"github.com/moby/buildkit/client/llb"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/project-dalec/dalec"
 	"github.com/project-dalec/dalec/packaging/linux/rpm"
 )
@@ -32,17 +34,22 @@ type dnfInstallConfig struct {
 
 	constraints []llb.ConstraintsOpt
 
-	downloadOnly bool
-
-	allDeps bool
-
-	downloadDir string
-
 	// When true, don't omit docs from the installed RPMs.
 	includeDocs bool
+
+	forceArch string
 }
 
 type DnfInstallOpt func(*dnfInstallConfig)
+
+// joinUnderRoot joins a rootfs path with an absolute container path.
+// We must not use filepath.Join(root, "/abs") because that drops `root`.
+func joinUnderRoot(root, abs string) string {
+	if root == "" {
+		return abs
+	}
+	return path.Join(root, strings.TrimPrefix(abs, "/"))
+}
 
 // see comment in tdnfInstall for why this additional option is needed
 func DnfImportKeys(keys []string) DnfInstallOpt {
@@ -63,11 +70,9 @@ func DnfAtRoot(root string) DnfInstallOpt {
 	}
 }
 
-func DnfDownloadAllDeps(dest string) DnfInstallOpt {
+func DnfForceArch(arch string) DnfInstallOpt {
 	return func(cfg *dnfInstallConfig) {
-		cfg.downloadOnly = true
-		cfg.allDeps = true
-		cfg.downloadDir = dest
+		cfg.forceArch = arch
 	}
 }
 
@@ -77,9 +82,9 @@ func IncludeDocs(v bool) DnfInstallOpt {
 	}
 }
 
-func dnfInstallWithConstraints(opts []llb.ConstraintsOpt) DnfInstallOpt {
+func DnfInstallWithConstraints(opts []llb.ConstraintsOpt) DnfInstallOpt {
 	return func(cfg *dnfInstallConfig) {
-		cfg.constraints = opts
+		cfg.constraints = append(cfg.constraints, opts...)
 	}
 }
 
@@ -89,18 +94,6 @@ func dnfInstallFlags(cfg *dnfInstallConfig) string {
 	if cfg.root != "" {
 		cmdOpts += " --installroot=" + cfg.root
 		cmdOpts += " --setopt=reposdir=/etc/yum.repos.d"
-	}
-
-	if cfg.downloadOnly {
-		cmdOpts += " --downloadonly"
-	}
-
-	if cfg.allDeps {
-		cmdOpts += " --alldeps"
-	}
-
-	if cfg.downloadDir != "" {
-		cmdOpts += " --downloaddir " + cfg.downloadDir
 	}
 
 	if !cfg.includeDocs {
@@ -145,21 +138,37 @@ func dnfCommand(cfg *dnfInstallConfig, releaseVer string, exe string, dnfSubCmd 
 
 	cacheDir := "/var/cache/" + exe
 	if cfg.root != "" {
-		cacheDir = filepath.Join(cfg.root, cacheDir)
+		cacheDir = joinUnderRoot(cfg.root, cacheDir)
 	}
 	installFlags := dnfInstallFlags(cfg)
 	installFlags += " -y --setopt varsdir=/etc/dnf/vars --releasever=" + releaseVer + " "
+	forceArch := cfg.forceArch
 	installScriptDt := `#!/usr/bin/env bash
 set -eux -o pipefail
 
 import_keys_path="` + importKeysPath + `"
 cmd="` + exe + `"
 install_flags="` + installFlags + `"
+force_arch="` + forceArch + `"
 dnf_sub_cmd="` + strings.Join(dnfSubCmd, " ") + `"
 cache_dir="` + cacheDir + `"
 
 if [ -x "$import_keys_path" ]; then
 	"$import_keys_path"
+fi
+
+if [ "$cmd" = "tdnf" ] && command -v dnf &>/dev/null; then
+	# tdnf has a lot of limitations that cause issues (no --forcearch, issues with gpg keys on local file installs)
+	# We already have dnf, so prefer that.
+	cmd="dnf"
+fi
+
+if [ -n "$force_arch" ]; then
+	if [ "$cmd" = "tdnf" ]; then
+		echo "tdnf does not support --forcearch; cross-arch installs must use dnf" >&2
+		exit 70
+	fi
+	install_flags="$install_flags --forcearch=$force_arch"
 fi
 
 $cmd $dnf_sub_cmd $install_flags "${@}"
@@ -181,7 +190,7 @@ $cmd $dnf_sub_cmd $install_flags "${@}"
 	if len(cfg.keys) > 0 {
 		importScript := importGPGScript(cfg.keys)
 		runOpts = append(runOpts, llb.AddMount(importKeysPath,
-			llb.Scratch().File(llb.Mkfile("/import-keys.sh", 0755, []byte(importScript))),
+			llb.Scratch().File(llb.Mkfile("/import-keys.sh", 0755, []byte(importScript)), cfg.constraints...),
 			llb.Readonly,
 			llb.SourcePath("/import-keys.sh")))
 	}
@@ -196,10 +205,59 @@ $cmd $dnf_sub_cmd $install_flags "${@}"
 	return dalec.WithRunOptions(runOpts...)
 }
 
+func (cfg *Config) InstallIntoRoot(rootfsPath string, pkgs []string, targetArch string, buildPlat ocispecs.Platform) llb.RunOption {
+	return dalec.RunOptFunc(func(ei *llb.ExecInfo) {
+		// Ensure the package manager runs on the build/executor platform (native),
+		// while installing into the mounted target rootfs via --installroot.
+		bp := buildPlat
+		ei.Constraints.Platform = &bp
+
+		installOpts := []DnfInstallOpt{
+			DnfAtRoot(rootfsPath),
+			DnfForceArch(targetArch),
+			DnfInstallWithConstraints([]llb.ConstraintsOpt{dalec.WithConstraint(&ei.Constraints)}),
+		}
+
+		var installCfg dnfInstallConfig
+		dnfInstallOptions(&installCfg, installOpts)
+
+		cacheKey := cfg.CacheName
+		if cfg.CacheAddPlatform {
+			cacheKey += "-" + targetArch
+		}
+		// Cross-arch installs always use dnf --forcearch --installroot
+		runOpts := []llb.RunOption{
+			DnfInstall(&installCfg, cfg.ReleaseVer, pkgs),
+		}
+
+		// Mount package manager caches under the target rootfs (may include multiple dirs).
+		for _, d := range cfg.CacheDir {
+			if d == "" {
+				continue
+			}
+			k := cacheKey
+			if len(cfg.CacheDir) > 1 {
+				k = cacheKey + "-" + filepath.Base(d)
+			}
+			runOpts = append(runOpts,
+				llb.AddMount(
+					joinUnderRoot(rootfsPath, d),
+					llb.Scratch(),
+					llb.AsPersistentCacheDir(k, llb.CacheMountLocked),
+				),
+			)
+		}
+
+		dalec.WithRunOptions(runOpts...).SetRunOption(ei)
+	})
+}
+
 func DnfInstall(cfg *dnfInstallConfig, releaseVer string, pkgs []string) llb.RunOption {
 	return dnfCommand(cfg, releaseVer, "dnf", append([]string{"install"}, pkgs...), nil)
 }
 
+// TdnfInstall uses tdnf to install packages
+// NOTE: tdnf will be automatically upgraded to dnf to work around tdnf limitations *if* dnf is available
 func TdnfInstall(cfg *dnfInstallConfig, releaseVer string, pkgs []string) llb.RunOption {
 	return dnfCommand(cfg, releaseVer, "tdnf", append([]string{"install"}, pkgs...), nil)
 }
@@ -209,6 +267,7 @@ func (cfg *Config) InstallBuildDeps(spec *dalec.Spec, sOpt dalec.SourceOpts, tar
 	if len(deps) == 0 {
 		return dalec.NoopStateOption
 	}
+
 	repos := spec.GetBuildRepos(targetKey)
 	return cfg.WithDeps(sOpt, targetKey, spec.Name, deps, repos, opts...)
 }
@@ -218,6 +277,8 @@ func (cfg *Config) WithDeps(sOpt dalec.SourceOpts, targetKey, pkgName string, de
 		if len(deps) == 0 {
 			return in
 		}
+
+		opts = append(opts, dalec.ProgressGroup(fmt.Sprintf("Installing dependencies for %s", pkgName)))
 
 		spec := &dalec.Spec{
 			Name:        fmt.Sprintf("%s-dependencies", pkgName),
@@ -244,6 +305,7 @@ func (cfg *Config) WithDeps(sOpt dalec.SourceOpts, targetKey, pkgName string, de
 			DnfWithMounts(llb.AddMount(rpmMountDir, rpmDir, llb.SourcePath("/RPMS"), llb.Readonly)),
 			DnfWithMounts(repoMounts),
 			DnfImportKeys(keyPaths),
+			DnfInstallWithConstraints(opts),
 		}
 
 		install := cfg.Install([]string{filepath.Join(rpmMountDir, "*/*.rpm")}, installOpts...)
@@ -264,9 +326,13 @@ func (cfg *Config) DownloadDeps(sOpt dalec.SourceOpts, spec *dalec.Spec, targetK
 
 	worker := cfg.Worker(sOpt, dalec.Platform(sOpt.TargetPlatform), dalec.WithConstraints(opts...))
 
+	installOpts := []DnfInstallOpt{
+		DnfInstallWithConstraints(opts),
+	}
+
 	worker = worker.Run(
 		dalec.WithConstraints(opts...),
-		cfg.Install([]string{"dnf-utils"}),
+		cfg.Install([]string{"dnf-utils"}, installOpts...),
 	).Root()
 
 	args := []string{"--downloaddir", "/output", "download"}
@@ -283,11 +349,10 @@ func (cfg *Config) DownloadDeps(sOpt dalec.SourceOpts, spec *dalec.Spec, targetK
 	installTimeRepos := spec.GetInstallRepos(targetKey)
 	repoMounts, keyPaths := cfg.RepoMounts(installTimeRepos, sOpt, opts...)
 
-	installOpts := []DnfInstallOpt{
+	installOpts = append(installOpts,
 		DnfWithMounts(repoMounts),
 		DnfImportKeys(keyPaths),
-		dnfInstallWithConstraints(opts),
-	}
+	)
 
 	var installCfg dnfInstallConfig
 	dnfInstallOptions(&installCfg, installOpts)
