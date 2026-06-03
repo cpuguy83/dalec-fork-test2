@@ -1,0 +1,58 @@
+name: Mirror binfmt to GHCR
+
+# Seeds (or refreshes) the GHCR mirror of the pinned tonistiigi/binfmt image so
+# release builds can pull the QEMU/binfmt emulators from GHCR instead of Docker
+# Hub, whose egress on hosted runners intermittently times out. Run this once
+# per repository owner (and again whenever the pinned digest below is bumped).
+# The digest MUST stay in sync with the one in worker-images.yml "Setup QEMU".
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    permissions:
+      packages: write
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        with:
+          egress-policy: audit
+
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        name: Login to GHCR
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mirror binfmt
+        run: |
+          set -eu -o pipefail
+
+          digest="sha256:d3b963f787999e6c0219a48dba02978769286ff61a5f4d26245cb6a6e5567ea3"
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          src="docker.io/tonistiigi/binfmt:latest@${digest}"
+          dst="ghcr.io/${owner}/binfmt"
+
+          # imagetools create is digest-preserving, so the mirror keeps the same
+          # ${digest} and the pin in worker-images.yml resolves against GHCR.
+          for attempt in 1 2 3 4 5; do
+            if docker buildx imagetools create -t "${dst}:latest" "$src"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "Failed to mirror binfmt after 5 attempts." >&2
+              exit 1
+            fi
+            echo "Mirror attempt ${attempt} failed; retrying in $((attempt * 15))s..." >&2
+            sleep "$((attempt * 15))"
+          done
+
+          # Confirm the digest was preserved on the mirror.
+          docker buildx imagetools inspect "${dst}@${digest}" >/dev/null
+          echo "Mirrored ${dst}@${digest}"
