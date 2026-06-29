@@ -290,7 +290,18 @@ jobs:
           # test so the integration suite runs against it instead of the
           # engine's embedded buildkit. dial-stdio (used by the test harness)
           # and the bake pre-builds all target the current builder.
+          #
+          # Disable buildkitd GC so the prebuilt worker (base + toolchain) and
+          # other cache records survive the whole suite instead of being evicted
+          # under disk pressure, forcing tests to reinstall the toolchain. The
+          # runner is ephemeral and pruned above, so unbounded growth for one run
+          # is acceptable; the df -h after the tests guards against disk-full.
+          cat > /tmp/buildkitd.toml <<'EOF'
+          [worker.oci]
+            gc = false
+          EOF
           docker buildx create --use \
+            --buildkitd-config /tmp/buildkitd.toml \
             --driver-opt network=host \
             --driver-opt image=${BUILDKIT_TEST_IMAGE}
       - name: Pre-build base images
@@ -375,6 +386,13 @@ jobs:
           TEST_SUITE: ${{ matrix.suite }}
           TEST_SKIP: ${{ matrix.skip }}
 
+      - name: Disk and build cache usage
+        if: always()
+        run: |
+          # With buildkitd GC disabled, watch disk headroom and how large the
+          # build cache grew over the suite.
+          df -h
+          docker buildx du || true
 
       - name: Upload integration coverage profile
         if: always()
