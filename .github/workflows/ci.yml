@@ -301,7 +301,12 @@ jobs:
           # environment exposed by ghaction-github-runtime above. The frontend
           # is built per-run so it uses a gha scope; the worker reuses ghcr
           # caches below.
+          #
+          # Build the frontend with the same tags the test harness uses
+          # (see test/testenv/build.go) so the prebuilt binary and Go build
+          # cache match what the tests request instead of diverging.
           docker buildx bake frontend \
+            --set "*.args.EXTRA_BUILD_FLAGS=-tags alt_testing_targets" \
             --set "*.cache-from=type=gha,scope=ci-frontend" \
             --set "*.cache-to=type=gha,mode=max,scope=ci-frontend"
 
